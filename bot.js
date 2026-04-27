@@ -15,6 +15,10 @@ const CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const DESCRIPTION_MAX_LENGTH = 250;
 const MAX_NEWS_PER_CHECK = 3;
 const TRANSLATE_API_URL = "https://api.mymemory.translated.net/get";
+const TRANSLATION_RETRY_COUNT = 3;
+const TRANSLATION_RETRY_DELAY_MS = 5000;
+const ENGLISH_LETTERS_THRESHOLD = 20;
+const ENGLISH_WORDS_THRESHOLD = 4;
 const SENT_NEWS_FILE = path.join(__dirname, "sent_news.json");
 const CTA_PROBABILITY = 0.4;
 const HEADLINE_ONLY_PROBABILITY = 0.3;
@@ -97,6 +101,65 @@ function truncateText(text, maxLength) {
   }
 
   return `${text.slice(0, maxLength - 3).trim()}...`;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function countRegexMatches(text, pattern) {
+  return (text.match(pattern) || []).length;
+}
+
+function hasArabicLetters(text) {
+  return /[\u0600-\u06FF]/.test(text || "");
+}
+
+function hasTooManyEnglishLetters(text) {
+  if (!text) {
+    return false;
+  }
+
+  const englishLettersCount = countRegexMatches(text, /[A-Za-z]/g);
+  const englishWordsCount = countRegexMatches(text, /\b[A-Za-z]{4,}\b/g);
+
+  return (
+    englishLettersCount >= ENGLISH_LETTERS_THRESHOLD ||
+    englishWordsCount >= ENGLISH_WORDS_THRESHOLD
+  );
+}
+
+function normalizeTextForComparison(text) {
+  return (text || "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function isValidArabicTranslation(originalText, translatedText) {
+  const normalizedTranslatedText = normalizeTextForComparison(translatedText);
+
+  if (!normalizedTranslatedText) {
+    return false;
+  }
+
+  if (!hasArabicLetters(translatedText)) {
+    return false;
+  }
+
+  if (hasTooManyEnglishLetters(translatedText)) {
+    return false;
+  }
+
+  const normalizedOriginalText = normalizeTextForComparison(originalText);
+  const originalContainsEnglish = /[A-Za-z]/.test(originalText || "");
+
+  if (
+    originalContainsEnglish &&
+    normalizedOriginalText &&
+    normalizedTranslatedText === normalizedOriginalText
+  ) {
+    return false;
+  }
+
+  return true;
 }
 
 function extractImageUrl(item) {
@@ -313,29 +376,68 @@ async function markArticlesAsSent(articles) {
   }
 }
 
-async function translateText(text) {
+async function translateText(text, fieldName, articleLabel) {
   if (!text) {
-    return text;
+    return null;
   }
 
-  try {
-    const response = await axios.get(TRANSLATE_API_URL, {
-      timeout: 15000,
-      params: {
-        q: text,
-        langpair: "en|ar",
-      },
-    });
+  for (let attempt = 1; attempt <= TRANSLATION_RETRY_COUNT; attempt += 1) {
+    try {
+      const response = await axios.get(TRANSLATE_API_URL, {
+        timeout: 15000,
+        params: {
+          q: text,
+          langpair: "en|ar",
+        },
+      });
 
-    const translatedText = response.data?.responseData?.translatedText;
-    return translatedText ? translatedText.trim() : text;
+      const translatedText = response.data?.responseData?.translatedText?.trim();
+
+      if (isValidArabicTranslation(text, translatedText)) {
+        return translatedText;
+      }
+
+      console.log(
+        `[translate] ترجمة ${fieldName} غير صالحة للمقال "${articleLabel}" في المحاولة ${attempt}.`
+      );
   } catch (error) {
     console.log("[translate] فشلت الترجمة، سيتم استخدام النص الأصلي:", error.message);
-    return text;
+      console.log(
+        `[translate] فشلت ترجمة ${fieldName} للمقال "${articleLabel}" في المحاولة ${attempt}: ${error.message}`
+      );
+    }
+
+    if (attempt < TRANSLATION_RETRY_COUNT) {
+      await sleep(TRANSLATION_RETRY_DELAY_MS);
+    }
   }
+
+  return null;
 }
 
 async function translateArticle(article) {
+  const articleLabel = article.title || article.link || "بدون عنوان";
+  const requiredTranslatedTitle = await translateText(
+    article.title,
+    "العنوان",
+    articleLabel
+  );
+  const requiredTranslatedDescription = await translateText(
+    article.description,
+    "الوصف",
+    articleLabel
+  );
+
+  if (!requiredTranslatedTitle || !requiredTranslatedDescription) {
+    return null;
+  }
+
+  return {
+    ...article,
+    translatedTitle: requiredTranslatedTitle,
+    translatedDescription: requiredTranslatedDescription,
+  };
+
   const translatedTitle = await translateText(article.title);
   const translatedDescription = await translateText(article.description);
 
@@ -357,6 +459,35 @@ async function sendTextMessage(message) {
 }
 
 async function sendArticle(article) {
+  const preparedArticle = await translateArticle(article);
+
+  if (!preparedArticle) {
+    console.log(`[translate] تم تخطي الخبر بسبب فشل الترجمة: ${article.title || article.link}`);
+    return null;
+  }
+
+  const preparedMessage = buildNewsMessage(preparedArticle);
+
+  if (hasTooManyEnglishLetters(preparedMessage)) {
+    console.log(
+      `[translate] تم تخطي الخبر بسبب احتوائه على نص إنجليزي بعد الترجمة: ${article.title || article.link}`
+    );
+    return null;
+  }
+
+  if (preparedArticle.imageUrl) {
+    try {
+      await bot.sendPhoto(TELEGRAM_CHAT_ID, preparedArticle.imageUrl, {
+        caption: preparedMessage,
+      });
+      return true;
+    } catch (error) {
+      console.error("[telegram] فشل إرسال الصورة، سيتم الإرسال كنص:", error.message);
+    }
+  }
+
+  return sendTextMessage(preparedMessage);
+
   const translatedArticle = await translateArticle(article);
   const message = buildNewsMessage(translatedArticle);
 
@@ -419,6 +550,25 @@ async function checkForNewArticles() {
     console.log("[news] لا توجد أخبار جديدة حاليًا.");
     return;
   }
+
+  for (const article of newArticles) {
+    const sent = await sendArticle(article);
+
+    if (sent === true) {
+      await markArticleAsSent(article);
+      console.log(`[telegram] تم إرسال خبر جديد: ${article.title}`);
+      continue;
+    }
+
+    if (sent === null) {
+      await markArticleAsSent(article);
+      continue;
+    }
+
+    console.error(`[telegram] تعذر إرسال الخبر: ${article.title}`);
+  }
+
+  return;
 
   for (const article of newArticles) {
     const sent = await sendArticle(article);
