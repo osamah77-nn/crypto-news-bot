@@ -12,13 +12,14 @@ const RSS_FEEDS = [
   "https://bitcoinmagazine.com/.rss/full/",
 ];
 const CHECK_INTERVAL_MS = 5 * 60 * 1000;
-const DESCRIPTION_MAX_LENGTH = 250;
 const MAX_NEWS_PER_CHECK = 3;
 const TRANSLATE_API_URL = "https://api.mymemory.translated.net/get";
 const TRANSLATION_RETRY_COUNT = 3;
 const TRANSLATION_RETRY_DELAY_MS = 5000;
 const ENGLISH_LETTERS_THRESHOLD = 20;
 const ENGLISH_WORDS_THRESHOLD = 4;
+const TELEGRAM_MESSAGE_LIMIT = 4096;
+const TELEGRAM_CAPTION_LIMIT = 1024;
 const SENT_NEWS_FILE = path.join(__dirname, "sent_news.json");
 const CTA_PROBABILITY = 0.4;
 const HEADLINE_ONLY_PROBABILITY = 0.3;
@@ -95,14 +96,6 @@ function stripHtmlTags(text) {
     .trim();
 }
 
-function truncateText(text, maxLength) {
-  if (text.length <= maxLength) {
-    return text;
-  }
-
-  return `${text.slice(0, maxLength - 3).trim()}...`;
-}
-
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -172,6 +165,7 @@ function extractImageUrl(item) {
 
   for (const getImageUrl of tagSources) {
     const imageUrl = getImageUrl();
+
     if (imageUrl) {
       return imageUrl;
     }
@@ -195,7 +189,7 @@ function extractDescription(item) {
     return "لا توجد تفاصيل إضافية متاحة حالياً.";
   }
 
-  return truncateText(cleanedDescription, DESCRIPTION_MAX_LENGTH);
+  return cleanedDescription;
 }
 
 function extractPublishedAt(item) {
@@ -303,6 +297,40 @@ function buildNewsMessage(article) {
   return lines.join("\n");
 }
 
+function splitTextIntoChunks(text, maxLength) {
+  if (!text) {
+    return [];
+  }
+
+  const chunks = [];
+  let startIndex = 0;
+
+  while (startIndex < text.length) {
+    let endIndex = Math.min(startIndex + maxLength, text.length);
+
+    if (endIndex < text.length) {
+      let splitIndex = text.lastIndexOf("\n", endIndex);
+
+      if (splitIndex < startIndex) {
+        splitIndex = text.lastIndexOf(" ", endIndex);
+      }
+
+      if (splitIndex >= startIndex) {
+        endIndex = splitIndex + 1;
+      }
+    }
+
+    if (endIndex <= startIndex) {
+      endIndex = Math.min(startIndex + maxLength, text.length);
+    }
+
+    chunks.push(text.slice(startIndex, endIndex));
+    startIndex = endIndex;
+  }
+
+  return chunks;
+}
+
 async function ensureStateFile() {
   try {
     await fs.promises.access(SENT_NEWS_FILE, fs.constants.F_OK);
@@ -400,8 +428,7 @@ async function translateText(text, fieldName, articleLabel) {
       console.log(
         `[translate] ترجمة ${fieldName} غير صالحة للمقال "${articleLabel}" في المحاولة ${attempt}.`
       );
-  } catch (error) {
-    console.log("[translate] فشلت الترجمة، سيتم استخدام النص الأصلي:", error.message);
+    } catch (error) {
       console.log(
         `[translate] فشلت ترجمة ${fieldName} للمقال "${articleLabel}" في المحاولة ${attempt}: ${error.message}`
       );
@@ -417,29 +444,16 @@ async function translateText(text, fieldName, articleLabel) {
 
 async function translateArticle(article) {
   const articleLabel = article.title || article.link || "بدون عنوان";
-  const requiredTranslatedTitle = await translateText(
-    article.title,
-    "العنوان",
-    articleLabel
-  );
-  const requiredTranslatedDescription = await translateText(
+  const translatedTitle = await translateText(article.title, "العنوان", articleLabel);
+  const translatedDescription = await translateText(
     article.description,
     "الوصف",
     articleLabel
   );
 
-  if (!requiredTranslatedTitle || !requiredTranslatedDescription) {
+  if (!translatedTitle || !translatedDescription) {
     return null;
   }
-
-  return {
-    ...article,
-    translatedTitle: requiredTranslatedTitle,
-    translatedDescription: requiredTranslatedDescription,
-  };
-
-  const translatedTitle = await translateText(article.title);
-  const translatedDescription = await translateText(article.description);
 
   return {
     ...article,
@@ -450,7 +464,12 @@ async function translateArticle(article) {
 
 async function sendTextMessage(message) {
   try {
-    await bot.sendMessage(TELEGRAM_CHAT_ID, message);
+    const messageChunks = splitTextIntoChunks(message, TELEGRAM_MESSAGE_LIMIT);
+
+    for (const chunk of messageChunks) {
+      await bot.sendMessage(TELEGRAM_CHAT_ID, chunk);
+    }
+
     return true;
   } catch (error) {
     console.error("[telegram] فشل إرسال الرسالة النصية:", error.message);
@@ -459,44 +478,33 @@ async function sendTextMessage(message) {
 }
 
 async function sendArticle(article) {
-  const preparedArticle = await translateArticle(article);
+  const translatedArticle = await translateArticle(article);
 
-  if (!preparedArticle) {
+  if (!translatedArticle) {
     console.log(`[translate] تم تخطي الخبر بسبب فشل الترجمة: ${article.title || article.link}`);
     return null;
   }
 
-  const preparedMessage = buildNewsMessage(preparedArticle);
+  const message = buildNewsMessage(translatedArticle);
 
-  if (hasTooManyEnglishLetters(preparedMessage)) {
+  if (hasTooManyEnglishLetters(message)) {
     console.log(
       `[translate] تم تخطي الخبر بسبب احتوائه على نص إنجليزي بعد الترجمة: ${article.title || article.link}`
     );
     return null;
   }
 
-  if (preparedArticle.imageUrl) {
-    try {
-      await bot.sendPhoto(TELEGRAM_CHAT_ID, preparedArticle.imageUrl, {
-        caption: preparedMessage,
-      });
-      return true;
-    } catch (error) {
-      console.error("[telegram] فشل إرسال الصورة، سيتم الإرسال كنص:", error.message);
-    }
-  }
-
-  return sendTextMessage(preparedMessage);
-
-  const translatedArticle = await translateArticle(article);
-  const message = buildNewsMessage(translatedArticle);
-
   if (translatedArticle.imageUrl) {
     try {
-      await bot.sendPhoto(TELEGRAM_CHAT_ID, translatedArticle.imageUrl, {
-        caption: message,
-      });
-      return true;
+      if (message.length <= TELEGRAM_CAPTION_LIMIT) {
+        await bot.sendPhoto(TELEGRAM_CHAT_ID, translatedArticle.imageUrl, {
+          caption: message,
+        });
+        return true;
+      }
+
+      await bot.sendPhoto(TELEGRAM_CHAT_ID, translatedArticle.imageUrl);
+      return sendTextMessage(message);
     } catch (error) {
       console.error("[telegram] فشل إرسال الصورة، سيتم الإرسال كنص:", error.message);
     }
@@ -547,7 +555,7 @@ async function checkForNewArticles() {
     .slice(0, MAX_NEWS_PER_CHECK);
 
   if (newArticles.length === 0) {
-    console.log("[news] لا توجد أخبار جديدة حاليًا.");
+    console.log("[news] لا توجد أخبار جديدة حالياً.");
     return;
   }
 
@@ -566,19 +574,6 @@ async function checkForNewArticles() {
     }
 
     console.error(`[telegram] تعذر إرسال الخبر: ${article.title}`);
-  }
-
-  return;
-
-  for (const article of newArticles) {
-    const sent = await sendArticle(article);
-
-    if (sent) {
-      await markArticleAsSent(article);
-      console.log(`[telegram] تم إرسال خبر جديد: ${article.title}`);
-    } else {
-      console.error(`[telegram] تعذر إرسال الخبر: ${article.title}`);
-    }
   }
 }
 
